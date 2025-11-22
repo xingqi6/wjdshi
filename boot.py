@@ -7,6 +7,7 @@ import tarfile
 import shutil
 from datetime import datetime
 from webdav3.client import Client
+import requests
 
 # ==========================================
 # 1. 配置区域
@@ -21,16 +22,21 @@ def log(msg):
     print(f"[System] {msg}", flush=True)
 
 # ==========================================
-# 2. 智能 WebDAV 客户端 (支持轮转 + 自定义时间)
+# 2. 智能 WebDAV 客户端 (修复 403 问题)
 # ==========================================
 def get_webdav_client():
     url = os.environ.get("WEBDAV_URL", "").strip()
     user = os.environ.get("WEBDAV_USER", "").strip()
     pwd = os.environ.get("WEBDAV_PASS", "").strip()
+    # 确保路径不以 / 开头或结尾，避免双斜杠问题
     path = os.environ.get("WEBDAV_PATH", "sys_backup").strip("/")
     
     if not url: return None, None
     
+    # 修正 URL，确保以 / 结尾
+    if not url.endswith("/"):
+        url += "/"
+
     options = {
         'webdav_hostname': url,
         'webdav_login': user,
@@ -42,20 +48,32 @@ def get_webdav_client():
 def restore_data():
     client, remote_dir = get_webdav_client()
     if not client:
-        log("WebDAV not configured. Skipping restore.")
+        log("WebDAV not configured.")
         return
 
     try:
-        log(f"Checking remote storage: /{remote_dir} ...")
-        if not client.check(remote_dir):
-            log("Remote directory not found. New deployment.")
+        # 1. 检查远程目录
+        # TeraCloud 特殊处理：直接列出根目录看文件夹在不在，比 check() 更准
+        log(f"Checking remote storage for folder: {remote_dir}")
+        root_files = client.list("/")
+        # 加上斜杠匹配目录
+        dir_exists = False
+        for f in root_files:
+            # 清理末尾斜杠进行比较
+            if f.rstrip("/") == remote_dir:
+                dir_exists = True
+                break
+        
+        if not dir_exists:
+            log(f"Remote folder '{remote_dir}' does not exist. Skipping restore.")
             return
 
+        # 2. 获取备份列表
         files = client.list(remote_dir)
         backups = [f for f in files if f.startswith(BACKUP_PREFIX) and f.endswith(".bin")]
         
         if not backups:
-            log("No backup files found.")
+            log("No backup files found in remote folder.")
             return
 
         latest_backup = sorted(backups)[-1]
@@ -74,33 +92,28 @@ def restore_data():
         log("System state restored successfully.")
 
     except Exception as e:
-        log(f"Restore Error: {str(e)}")
+        log(f"Restore Notice: {str(e)}")
 
 def backup_worker():
-    # 获取自定义备份间隔 (默认 3600 秒)
     try:
         interval = int(os.environ.get("SYNC_INTERVAL", "3600"))
     except:
         interval = 3600
+    if interval < 60: interval = 60
     
-    # 安全限制：最小 60 秒
-    if interval < 60: 
-        interval = 60
-        log("Warning: SYNC_INTERVAL too low, reset to 60s.")
-    
-    log(f"Backup scheduler started. Interval: {interval} seconds.")
-
-    # 启动后延迟 2 分钟进行第一次尝试，避免抢占启动资源
-    time.sleep(120)
+    log(f"Backup scheduler started. Interval: {interval}s")
+    time.sleep(120) 
     
     while True:
         try:
             client, remote_dir = get_webdav_client()
             if client and os.path.exists("data"):
-                # 1. 检查目录
-                if not client.check(remote_dir):
+                # 1. 确保目录存在 (更加暴力的创建方式，忽略已存在错误)
+                try:
                     client.mkdir(remote_dir)
-                
+                except:
+                    pass # 忽略 405/409 错误，说明目录已存在
+
                 # 2. 打包
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"{BACKUP_PREFIX}{timestamp}.bin"
@@ -109,30 +122,31 @@ def backup_worker():
                     tar.add("data", arcname=".")
                 
                 # 3. 上传
-                log(f"Uploading backup: {filename}")
+                log(f"Uploading: {filename} -> /{remote_dir}/")
                 client.upload_sync(remote_path=f"{remote_dir}/{filename}", local_path="temp_backup.tar.gz")
                 os.remove("temp_backup.tar.gz")
                 
-                # 4. 轮转 (保留最新的 5 个)
+                # 4. 清理旧文件
                 files = client.list(remote_dir)
                 backups = sorted([f for f in files if f.startswith(BACKUP_PREFIX) and f.endswith(".bin")])
                 
                 if len(backups) > 5:
-                    to_delete = backups[:-5]
-                    for f in to_delete:
-                        log(f"Rotating old backup: {f}")
+                    for f in backups[:-5]:
+                        log(f"Cleaning old backup: {f}")
                         client.clean(f"{remote_dir}/{f}")
                 
-                log("Backup cycle complete.")
+                log("Backup success.")
             
         except Exception as e:
             log(f"Backup failed: {str(e)}")
+            # 如果是 403，提示用户检查密码
+            if "403" in str(e):
+                log("CRITICAL: 403 Forbidden. Please use InfiniCloud 'Apps Connection' password, NOT login password!")
         
-        # 等待自定义的时间
         time.sleep(interval)
 
 # ==========================================
-# 3. Nginx 配置逻辑
+# 3. Nginx 配置
 # ==========================================
 def write_nginx_config():
     password = os.environ.get("AUTH_PASS", "password").strip()
@@ -157,7 +171,6 @@ server {{
             return 200 "System Maintenance. Service Offline.";
         }}
         proxy_pass http://127.0.0.1:5244;
-        # 允许 OpenList 接收 Token
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -171,7 +184,7 @@ server {{
         f.write(config_content)
 
 # ==========================================
-# 4. 主启动流程
+# 4. 启动流程
 # ==========================================
 def decrypt_payload():
     if not os.path.exists(ENCRYPTED_FILE):
@@ -199,13 +212,9 @@ def start_services():
     if not os.path.exists(BINARY_NAME):
         decrypt_payload()
     
-    # 1. 恢复数据
     restore_data()
-    
-    # 2. 写 Nginx
     write_nginx_config()
 
-    # 3. 初始化 OpenList
     if not os.path.exists("data/config.json"):
         try:
             subprocess.run([f"./{BINARY_NAME}", "server"], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -218,17 +227,13 @@ def start_services():
     password = os.environ.get("AUTH_PASS", "password").strip()
     subprocess.run([f"./{BINARY_NAME}", "admin", "set", password], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
-    # 4. 后台启动 OpenList
     with open("engine.log", "w") as logfile:
         subprocess.Popen([f"./{BINARY_NAME}", "server"], stdout=logfile, stderr=logfile)
     
-    # 5. 启动备份线程
     t = threading.Thread(target=backup_worker, daemon=True)
     t.start()
 
     time.sleep(3)
-    
-    # 6. 启动 Nginx
     log("Starting Gateway...")
     subprocess.run(["nginx", "-g", "daemon off;"])
 
