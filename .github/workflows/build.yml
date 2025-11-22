@@ -1,4 +1,4 @@
-name: Build Core Runtime
+name: Build Core Kernel
 
 on:
   workflow_dispatch:
@@ -7,8 +7,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # 修改这里：为了混淆，镜像名建议设置得像系统组件
-  IMAGE_NAME: ${{ github.repository_owner }}/sys-runtime-core
+  # 镜像名伪装成系统运行库
+  IMAGE_NAME: ${{ github.repository_owner }}/sys-runtime-lib
 
 jobs:
   build:
