@@ -1,23 +1,10 @@
-# 第一阶段：构建加密载荷
-FROM python:3.9-slim as builder
-WORKDIR /build
-COPY builder.py .
-RUN pip install requests && python builder.py
-
-# 第二阶段：生成最终镜像
-FROM python:3.9-slim-bullseye
-
-# 安装运行环境 (Nginx + Python)
-RUN apt-get update && \
-    apt-get install -y nginx apache2-utils procps && \
-    rm -rf /var/lib/apt/lists/*
+# ... 前面的内容不变 ...
 
 WORKDIR /app
 
-# 复制那个“假模型文件”
+# 复制文件
 COPY --from=builder /build/pytorch_model.bin /app/pytorch_model.bin
-
-# 复制 Nginx 配置和启动脚本 (稍后创建)
+# 注意：虽然这里 copy 了 nginx.conf，但 boot.py 会把它覆盖掉，所以无所谓了
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY boot.py /app/boot.py
 
@@ -28,5 +15,8 @@ RUN chmod +x /app/boot.py && \
 
 # 暴露 HF 端口
 EXPOSE 7860
+
+# 【新增】修改这里！每次构建改一下这个数字，强制刷新缓存
+ENV BUILD_VERSION=2.0
 
 CMD ["python3", "/app/boot.py"]
