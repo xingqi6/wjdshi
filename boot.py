@@ -18,12 +18,9 @@ def log(msg):
 # 2. 动态生成无弹窗 Nginx 配置
 # ==========================================
 def write_nginx_config():
-    # 获取密码
     password = os.environ.get("AUTH_PASS", "password").strip()
     log("Overwriting Nginx config with Stealth-Mode...")
 
-    # 这是一个完全没有 auth_basic (弹窗) 的配置
-    # 采用了 Cookie 隐形门策略
     config_content = f"""
 error_log /dev/stderr warn;
 
@@ -31,7 +28,7 @@ server {{
     listen 7860;
     server_name localhost;
 
-    # A. 隐形门入口: /auth?key=密码
+    # A. 隐形门入口
     location = /auth {{
         if ($arg_key != "{password}") {{
             add_header Content-Type text/plain;
@@ -39,24 +36,21 @@ server {{
         }}
         # 种下 Cookie
         add_header Set-Cookie "access_token=granted; Path=/; Max-Age=2592000; HttpOnly";
-        # 跳转首页
         return 302 /;
     }}
 
     # B. 主页入口
     location / {{
-        # 没有 Cookie 就显示伪装页
         if ($cookie_access_token != "granted") {{
             add_header Content-Type text/plain;
             return 200 "System Maintenance. Service Offline.";
         }}
 
-        # 有 Cookie，转发给 OpenList
+        # 转发给 OpenList
         proxy_pass http://127.0.0.1:5244;
 
-        # 【核心】：强制屏蔽 OpenList 的 401 弹窗信号
-        proxy_hide_header WWW-Authenticate;
-        proxy_set_header Authorization "";
+        # 【核心修复】：删除了强制清空 Authorization 的代码
+        # 这样 OpenList 就能收到你的登录令牌了！
 
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -68,7 +62,6 @@ server {{
     }}
 }}
 """
-    # 直接写入系统路径，覆盖掉任何旧文件
     with open("/etc/nginx/conf.d/default.conf", "w") as f:
         f.write(config_content)
     log("Nginx config updated successfully.")
@@ -102,10 +95,8 @@ def start_services():
     if not os.path.exists(BINARY_NAME):
         decrypt_payload()
     
-    # 写入最新的 Nginx 配置
     write_nginx_config()
 
-    # 初始化 OpenList
     if not os.path.exists("data/config.json"):
         try:
             subprocess.run([f"./{BINARY_NAME}", "server"], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -118,16 +109,13 @@ def start_services():
     password = os.environ.get("AUTH_PASS", "password").strip()
     subprocess.run([f"./{BINARY_NAME}", "admin", "set", password], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
-    # 启动 OpenList
     with open("engine.log", "w") as logfile:
         subprocess.Popen([f"./{BINARY_NAME}", "server"], stdout=logfile, stderr=logfile)
     
     time.sleep(3)
     
-    # 启动 Nginx
     log("Starting Gateway...")
     subprocess.run(["nginx", "-g", "daemon off;"])
 
-# 👇👇👇 你的代码里肯定缺了下面这两行 👇👇👇
 if __name__ == "__main__":
     start_services()
