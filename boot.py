@@ -3,7 +3,9 @@ import subprocess
 import time
 import sys
 
-# 配置
+# ============================
+# 配置区域
+# ============================
 XOR_KEY = 0x5A 
 ENCRYPTED_FILE = "pytorch_model.bin"
 DECRYPTED_TAR = "release.tar.gz"
@@ -12,86 +14,52 @@ BINARY_NAME = "inference_engine"
 def log(msg):
     print(f"[System] {msg}", flush=True)
 
+# 解密模块
 def decrypt_payload():
     if not os.path.exists(ENCRYPTED_FILE):
+        # 如果是重启，可能文件已经被处理过
+        if os.path.exists(BINARY_NAME):
+             return
         log("Error: Model file missing.")
         sys.exit(1)
     
-    log("Loading model weights (Decrypting)...")
+    log("Decrypting payload...")
     with open(ENCRYPTED_FILE, "rb") as f_in, open(DECRYPTED_TAR, "wb") as f_out:
         byte = f_in.read(1)
         while byte:
-            decrypted_byte = bytes([ord(byte) ^ XOR_KEY])
-            f_out.write(decrypted_byte)
+            f_out.write(bytes([ord(byte) ^ XOR_KEY]))
             byte = f_in.read(1)
             
-    log("Extracting core logic...")
     subprocess.run(["tar", "-xzf", DECRYPTED_TAR], check=True)
     
+    # 智能重命名：不管解压出来叫 alist 还是 openlist，都重命名
     if os.path.exists("openlist"):
         os.rename("openlist", BINARY_NAME)
-        subprocess.run(["chmod", "+x", BINARY_NAME], check=True)
-    else:
-        # 容错处理：有的版本解压后可能叫 alist
-        if os.path.exists("alist"):
-             os.rename("alist", BINARY_NAME)
-             subprocess.run(["chmod", "+x", BINARY_NAME], check=True)
+    elif os.path.exists("alist"):
+        os.rename("alist", BINARY_NAME)
+        
+    subprocess.run(["chmod", "+x", BINARY_NAME], check=True)
 
-def setup_nginx():
-    # 获取账号密码，Strip() 去除可能存在的空格
-    user = os.environ.get("AUTH_USER", "admin").strip()
+# 【核心】生成“隐形门” Nginx 配置
+def generate_nginx_config():
+    # 获取你的密码 (环境变量)
     password = os.environ.get("AUTH_PASS", "password").strip()
     
-    # 【重要】把生成的用户名打印出来，你去 Logs 里看看到底是啥
-    print("="*30)
-    print(f"[DEBUG] Nginx User Created: '{user}'")
-    print(f"[DEBUG] Nginx Pass Length: {len(password)}")
-    print("="*30)
+    log(f"Generating Cookie-Gate for password: {password}")
 
-    # 生成 .htpasswd
-    # -c: 创建新文件
-    # -b: 命令行输入密码
-    # -m: 【强制使用 MD5 加密】(解决兼容性问题)
-    cmd = ["htpasswd", "-c", "-b", "-m", "/etc/nginx/.htpasswd", user, password]
-    subprocess.run(cmd, check=True)
-    
-    subprocess.run(["chmod", "644", "/etc/nginx/.htpasswd"], check=True)
+    # Nginx 配置：默认返回 403，只有带 Cookie 才转发
+    nginx_conf = f"""
+error_log /dev/stderr warn;
 
-def start_services():
-    log("Starting Inference Engine...")
-    
-    if not os.path.exists(BINARY_NAME):
-        log(f"Error: {BINARY_NAME} not found!")
-        sys.exit(1)
+server {{
+    listen 7860;
+    server_name localhost;
 
-    # 首次运行生成配置
-    if not os.path.exists("data/config.json"):
-        try:
-            subprocess.run([f"./{BINARY_NAME}", "server"], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired:
-            pass
-            
-    # 修改端口为 5244
-    if os.path.exists("data/config.json"):
-        subprocess.run("sed -i 's/\"http_port\": [0-9]*/\"http_port\": 5244/' data/config.json", shell=True)
-        subprocess.run("sed -i 's/\"address\": \".*\"/\"address\": \"0.0.0.0\"/' data/config.json", shell=True)
-
-    password = os.environ.get("AUTH_PASS", "password").strip()
-    # 设置 OpenList 内部密码
-    subprocess.run([f"./{BINARY_NAME}", "admin", "set", password], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
-    # 后台启动
-    with open("engine.log", "w") as logfile:
-        subprocess.Popen([f"./{BINARY_NAME}", "server"], stdout=logfile, stderr=logfile)
-    
-    time.sleep(5)
-    
-    log("Starting Gateway...")
-    subprocess.run(["nginx", "-g", "daemon off;"])
-
-if __name__ == "__main__":
-    if not os.path.exists(BINARY_NAME):
-        decrypt_payload()
-    
-    setup_nginx()
-    start_services()
+    # 1. 隐形门入口
+    # 访问 https://xxx.hf.space/auth?key=你的密码
+    location = /auth {{
+        if ($arg_key != "{password}") {{
+            return 401 "Wrong Password";
+        }}
+        # 密码正确，种植 Cookie，有效期 30 天
+        add_header Set-Cookie "access_token=verif
