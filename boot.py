@@ -3,9 +3,7 @@ import subprocess
 import time
 import sys
 
-# ============================
-# 配置区域
-# ============================
+# 配置
 XOR_KEY = 0x5A 
 ENCRYPTED_FILE = "pytorch_model.bin"
 DECRYPTED_TAR = "release.tar.gz"
@@ -14,12 +12,9 @@ BINARY_NAME = "inference_engine"
 def log(msg):
     print(f"[System] {msg}", flush=True)
 
-# 解密模块
 def decrypt_payload():
     if not os.path.exists(ENCRYPTED_FILE):
-        # 如果是重启，可能文件已经被处理过
-        if os.path.exists(BINARY_NAME):
-             return
+        if os.path.exists(BINARY_NAME): return
         log("Error: Model file missing.")
         sys.exit(1)
     
@@ -32,7 +27,6 @@ def decrypt_payload():
             
     subprocess.run(["tar", "-xzf", DECRYPTED_TAR], check=True)
     
-    # 智能重命名：不管解压出来叫 alist 还是 openlist，都重命名
     if os.path.exists("openlist"):
         os.rename("openlist", BINARY_NAME)
     elif os.path.exists("alist"):
@@ -40,26 +34,47 @@ def decrypt_payload():
         
     subprocess.run(["chmod", "+x", BINARY_NAME], check=True)
 
-# 【核心】生成“隐形门” Nginx 配置
-def generate_nginx_config():
-    # 获取你的密码 (环境变量)
+def configure_nginx():
+    # 获取密码
     password = os.environ.get("AUTH_PASS", "password").strip()
+    log(f"Configuring Gateway with password: {password}")
     
-    log(f"Generating Cookie-Gate for password: {password}")
+    # 【核心】使用 sed 替换 nginx.conf 里的占位符
+    # 这样既保留了文件结构，又注入了动态密码
+    cmd = f"sed -i 's/###PASSWORD###/{password}/g' /etc/nginx/conf.d/default.conf"
+    subprocess.run(cmd, shell=True, check=True)
 
-    # Nginx 配置：默认返回 403，只有带 Cookie 才转发
-    nginx_conf = f"""
-error_log /dev/stderr warn;
+def start_services():
+    if not os.path.exists(BINARY_NAME):
+        decrypt_payload()
+    
+    # 配置 Nginx
+    configure_nginx()
 
-server {{
-    listen 7860;
-    server_name localhost;
+    # 初始化 OpenList 配置
+    if not os.path.exists("data/config.json"):
+        try:
+            subprocess.run([f"./{BINARY_NAME}", "server"], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except: pass
+            
+    # 修改 OpenList 端口
+    if os.path.exists("data/config.json"):
+        subprocess.run("sed -i 's/\"http_port\": [0-9]*/\"http_port\": 5244/' data/config.json", shell=True)
+        subprocess.run("sed -i 's/\"address\": \".*\"/\"address\": \"0.0.0.0\"/' data/config.json", shell=True)
 
-    # 1. 隐形门入口
-    # 访问 https://xxx.hf.space/auth?key=你的密码
-    location = /auth {{
-        if ($arg_key != "{password}") {{
-            return 401 "Wrong Password";
-        }}
-        # 密码正确，种植 Cookie，有效期 30 天
-        add_header Set-Cookie "access_token=verif
+    # 设置 OpenList 内部密码
+    password = os.environ.get("AUTH_PASS", "password").strip()
+    subprocess.run([f"./{BINARY_NAME}", "admin", "set", password], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # 后台启动 OpenList
+    with open("engine.log", "w") as logfile:
+        subprocess.Popen([f"./{BINARY_NAME}", "server"], stdout=logfile, stderr=logfile)
+    
+    time.sleep(3)
+    
+    # 启动 Nginx
+    log("Starting Nginx Gateway...")
+    subprocess.run(["nginx", "-g", "daemon off;"])
+
+if __name__ == "__main__":
+    start_services()
