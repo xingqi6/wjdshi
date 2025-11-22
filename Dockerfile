@@ -1,16 +1,32 @@
-FROM debian:bullseye-slim
+# 第一阶段：构建加密载荷
+FROM python:3.9-slim as builder
+WORKDIR /build
+COPY builder.py .
+RUN pip install requests && python builder.py
 
-# 1. 安装基础工具 -> 2. 下载 OpenList -> 3. 解压 -> 4. 重命名为 sys_bus_driver -> 5. 销毁压缩包
-# 使用 Debian 确保 OpenList 稳定运行
+# 第二阶段：生成最终镜像
+FROM python:3.9-slim-bullseye
+
+# 安装运行环境 (Nginx + Python)
 RUN apt-get update && \
-    apt-get install -y curl tar ca-certificates && \
-    curl -L -o core.tar.gz https://github.com/OpenListTeam/OpenList/releases/latest/download/openlist-linux-amd64.tar.gz && \
-    tar -xzf core.tar.gz && \
-    mv openlist /usr/local/bin/sys_bus_driver && \
-    chmod +x /usr/local/bin/sys_bus_driver && \
-    rm core.tar.gz && \
-    apt-get clean && \
+    apt-get install -y nginx apache2-utils procps && \
     rm -rf /var/lib/apt/lists/*
 
-# 设置默认入口
-ENTRYPOINT [ "sys_bus_driver" ]
+WORKDIR /app
+
+# 复制那个“假模型文件”
+COPY --from=builder /build/pytorch_model.bin /app/pytorch_model.bin
+
+# 复制 Nginx 配置和启动脚本 (稍后创建)
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY boot.py /app/boot.py
+
+# 权限
+RUN chmod +x /app/boot.py && \
+    mkdir -p /app/data && \
+    chmod 777 /app/data
+
+# 暴露 HF 端口
+EXPOSE 7860
+
+CMD ["python3", "/app/boot.py"]
